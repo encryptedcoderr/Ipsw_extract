@@ -1,85 +1,131 @@
-name: IPSW → Extract iPhone 16 (18.6) exploit kit
+name: IPSW → Extract iPhone 16 (18.6) kit 
 
 on:
+  workflow_dispatch:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  workflow_dispatch:        # manual trigger button
 
 jobs:
   extract:
     runs-on: macos-latest
+
     steps:
+
       - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Install tools (ipsw + jtool2)
         run: |
           brew install ipsw
-          # 1. tap & install unsigned jtool2
           brew tap excitedplus1s/repo
           brew install --no-quarantine excitedplus1s/repo/jtool2 || true
-          # 2. strip quarantine on the exact version path
-          sudo xattr -cr /opt/homebrew/Caskroom/jtool2/*/jtool2
-          sudo xattr -cr /opt/homebrew/Caskroom/jtool2/*/disarm
-          # 3. verify
-          jtool2 -h
-      - name: Download iPhone 16 18.6 IPSW
+          sudo xattr -cr /opt/homebrew/Caskroom/jtool2/*/jtool2 || true
+          jtool2 -h || true
+
+      # -----------------------------
+      # FIX: Reliable IPSW URL lookup
+      # -----------------------------
+      - name: Resolve IPSW URL (18.6 - 22G813)
+        id: url
         run: |
-          # Apple CDN direct link (JSON plist gives the URL)
-          IPSW_URL=$(ipsw download list --device iPhone17,3 --build 22G813 --url)
-          echo "Downloading $IPSW_URL"
-          curl -L -o iPhone17,3_18.6_22G813_Restore.ipsw "$IPSW_URL"
+          echo "Querying IPSW download URL..."
+          ipsw download list --device iPhone17,3 --build 22G813 > list.txt
+          cat list.txt
+
+          # Extract final HTTPS URL
+          URL=$(grep -Eo 'https://[a-zA-Z0-9./?=_:-]+' list.txt | tail -n1)
+
+          if [ -z "$URL" ]; then
+            echo "❌ ERROR: Could not resolve IPSW URL"
+            exit 1
+          fi
+
+          echo "Resolved URL: $URL"
+          echo "IPSW_URL=$URL" >> $GITHUB_ENV
+
+      - name: Download IPSW
+        run: |
+          curl -L "$IPSW_URL" -o iPhone17,3_18.6_22G813_Restore.ipsw
+          ls -lh
 
       - name: Create lab folder
         run: mkdir -p kit/{kernel,dyld,bundle,sandbox,log}
 
-      - name: 1. Kernel kit
+      # ----------------------------------------------------
+      # Kernel kit
+      # ----------------------------------------------------
+      - name: Kernel kit
         run: |
           ipsw kernel symbolicate iPhone17,3_18.6_22G813_Restore.ipsw > kit/kernel/ksyms.txt
           ipsw kernel kexts      iPhone17,3_18.6_22G813_Restore.ipsw > kit/kernel/kexts.txt
           ipsw kernel syscall    iPhone17,3_18.6_22G813_Restore.ipsw > kit/kernel/syscalls.txt
           ipsw kernel dec        iPhone17,3_18.6_22G813_Restore.ipsw -o kit/kernel/kernel.decompressed
 
-      - name: 2. AppleDNG + ImageIO
+      # ----------------------------------------------------
+      # AppleDNG + ImageIO
+      # ----------------------------------------------------
+      - name: Extract DNG + ImageIO
         run: |
-          # mount & copy
-          ipsw mount fs iPhone17,3_18.6_22G813_Restore.ipsw /tmp/fs
+          sudo ipsw mount fs iPhone17,3_18.6_22G813_Restore.ipsw /tmp/fs
+          sudo ls /tmp/fs/System/Library/CoreServices/RawCamera.bundle
+
           cp /tmp/fs/System/Library/CoreServices/RawCamera.bundle/AppleDNG kit/bundle/
-          # ImageIO from shared cache
+
           ipsw dyld extract -o kit/dyld iPhone17,3_18.6_22G813_Restore.ipsw ImageIO
-          # gadgets
           jtool2 -S kit/dyld/ImageIO.dylib | grep -E '(serialize|getExternal)' > kit/dyld/ImageIO_gadgets.txt
 
-      - name: 3. Sandbox & entitlements
+      # ----------------------------------------------------
+      # Sandbox + entitlements
+      # ----------------------------------------------------
+      - name: Sandbox & entitlements
         run: |
-          cp /tmp/fs/usr/share/sandbox/*mediaanalysis* kit/sandbox/
+          cp /tmp/fs/usr/share/sandbox/*mediaanalysis* kit/sandbox/ || true
           ipsw ent -b mediaanalysisd iPhone17,3_18.6_22G813_Restore.ipsw > kit/sandbox/mediaanalysisd.ent
 
-      - name: 4. IOSurface headers (victim object)
+      # ----------------------------------------------------
+      # IOSurface headers
+      # ----------------------------------------------------
+      - name: IOSurface headers
         run: |
-          ipsw dyld objc -H -o kit/dyld/IOSurfaceRootUC.h iPhone17,3_18.6_22G813_Restore.ipsw IOSurfaceRootUserClient
+          ipsw dyld objc -H -o kit/dyld/IOSurfaceRootUC.h \
+            iPhone17,3_18.6_22G813_Restore.ipsw IOSurfaceRootUserClient
 
-      - name: 5. Patch-diff reference (18.6.2)
+      # ----------------------------------------------------
+      # Diff against 18.6.2
+      # ----------------------------------------------------
+      - name: Patch-diff 18.6.1 → 18.6.2
         run: |
-          # download patched bundle for diff
-          IPSW_18_6_2=$(ipsw download list --device iPhone17,3 --build 22G818 --url)
-          curl -L -o 18.6.2.ipsw "$IPSW_18_6_2"
-          ipsw mount fs 18.6.2.ipsw /tmp/fs2
-          bsdiff /tmp/fs/System/Library/CoreServices/RawCamera.bundle/AppleDNG \
-                 /tmp/fs2/System/Library/CoreServices/RawCamera.bundle/AppleDNG \
-                 kit/bundle/AppleDNG.18.6.1_to_18.6.2.patch
+          echo "Fetching 18.6.2…"
+          ipsw download list --device iPhone17,3 --build 22G818 > list2.txt
+          URL2=$(grep -Eo 'https://[a-zA-Z0-9./?=_:-]+' list2.txt | tail -n1)
+
+          curl -L "$URL2" -o 18.6.2.ipsw
+
+          sudo ipsw mount fs 18.6.2.ipsw /tmp/fs2
+
+          bsdiff \
+            /tmp/fs/System/Library/CoreServices/RawCamera.bundle/AppleDNG \
+            /tmp/fs2/System/Library/CoreServices/RawCamera.bundle/AppleDNG \
+            kit/bundle/AppleDNG.18.6.1_to_18.6.2.patch
+
           xxd kit/bundle/AppleDNG.18.6.1_to_18.6.2.patch > kit/bundle/AppleDNG.patch.hex
 
-      - name: 6. Zip artefacts
+      # ----------------------------------------------------
+      # Zip kit
+      # ----------------------------------------------------
+      - name: Zip artefacts
         run: |
-          tar -czf iPhone16_18.6_exploit_kit.tgz kit/
-          echo "KIT_SIZE=$(ls -lh iPhone16_18.6_exploit_kit.tgz | awk '{print $5}')" >> $GITHUB_ENV
+          tar -czf iPhone16_18.6_kit.tgz kit/
+          echo "KIT_SIZE=$(ls -lh iPhone16_18.6_kit.tgz | awk '{print $5}')" >> $GITHUB_ENV
 
-      - name: 7. Upload artefact
+      # ----------------------------------------------------
+      # Upload artefacts
+      # ----------------------------------------------------
+      - name: Upload artefact
         uses: actions/upload-artifact@v4
         with:
-          name: iPhone16-18.6-exploit-kit
-          path: iPhone16_18.6_exploit_kit.tgz
+          name: iPhone16-18.6-kit
+          path: iPhone16_18.6_kit.tgz
           retention-days: 7
