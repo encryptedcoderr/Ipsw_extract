@@ -14,15 +14,17 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install tools (ipsw + jtool2)
         run: |
           brew install ipsw
-          # jtool2 is not in brew – grab signed binary
-          curl -L -o /usr/local/bin/jtool2 https://github.com/JohnCoates/jtool2/releases/download/v2.1/jtool2-mac
-          chmod +x /usr/local/bin/jtool2
-          ipsw version
-          jtool2 -h >/dev/null
-
+          # 1. tap & install unsigned jtool2
+          brew tap excitedplus1s/repo
+          brew install --no-quarantine excitedplus1s/repo/jtool2 || true
+          # 2. strip quarantine on the exact version path
+          sudo xattr -cr /opt/homebrew/Caskroom/jtool2/*/jtool2
+          sudo xattr -cr /opt/homebrew/Caskroom/jtool2/*/disarm
+          # 3. verify
+          jtool2 -h
       - name: Download iPhone 16 18.6 IPSW
         run: |
           # Apple CDN direct link (JSON plist gives the URL)
