@@ -12,6 +12,7 @@ jobs:
     runs-on: macos-latest
 
     steps:
+
       - name: Checkout repo
         uses: actions/checkout@v4
 
@@ -24,17 +25,16 @@ jobs:
           jtool2 -h || true
 
       # -----------------------------
-      # FIX: Reliable IPSW URL lookup
+      # FIX: Use correct subcommand: ipsw download ipsw --device --build
       # -----------------------------
       - name: Resolve IPSW URL (18.6 - 22G813)
         id: url
         run: |
           echo "Querying IPSW download URL..."
-          ipsw download list iPhone17,3 22G813 > list.txt
-          cat list.txt
+          ipsw download ipsw --device iPhone17,3 --build 22G813 --output list.json
+          cat list.json
 
-          # Extract final HTTPS URL
-          URL=$(grep -Eo 'https://[a-zA-Z0-9./?=_:-]+' list.txt | tail -n1)
+          URL=$(grep -Eo 'https://[a-zA-Z0-9./?=_:-]+' list.json | head -n1)
 
           if [ -z "$URL" ]; then
             echo "❌ ERROR: Could not resolve IPSW URL"
@@ -97,8 +97,8 @@ jobs:
       - name: Patch-diff 18.6.1 → 18.6.2
         run: |
           echo "Fetching 18.6.2…"
-          ipsw download list iPhone17,3 22G818 > list2.txt
-          URL2=$(grep -Eo 'https://[a-zA-Z0-9./?=_:-]+' list2.txt | tail -n1)
+          ipsw download ipsw --device iPhone17,3 --build 22G818 --output list2.json
+          URL2=$(grep -Eo 'https://[a-zA-Z0-9./?=_:-]+' list2.json | head -n1)
 
           curl -L "$URL2" -o 18.6.2.ipsw
 
