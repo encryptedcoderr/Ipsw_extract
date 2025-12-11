@@ -1,65 +1,101 @@
-name: IPSW Extraction Workflow
+name: IPSW → Extract iPhone 16 (18.6) kit (direct URL)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
 
 jobs:
   extract:
     runs-on: macos-latest
 
     steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Install tools (ipsw + jtool2)
+        run: |
+          brew install ipsw
+          brew tap excitedplus1s/repo
+          brew install --no-quarantine excitedplus1s/repo/jtool2 || true
+          sudo xattr -cr /opt/homebrew/Caskroom/jtool2/*/jtool2 || true
+          jtool2 -h || true
 
-    - name: Install Tools
-      run: |
-        brew install ipsw
-        brew tap excitedplus1s/repo
-        brew install excitedplus1s/repo/jtool2 || true
+      # -----------------------------
+      # Download IPSW via fixed URL (skip ipsw download)
+      # -----------------------------
+      - name: Download IPSW (direct URL)
+        run: |
+          IPSW_URL="https://updates.cdn-apple.com/2025SummerFCS/fullrestores/082-98952/853D36FA-A5F4-4B75-B5F3-8D38430F6132/iPhone17,3_18.6_22G86_Restore.ipsw"
+          echo "Downloading IPSW from fixed URL..."
+          curl -L "$IPSW_URL" -o iPhone17,3_18.6_22G86_Restore.ipsw
+          ls -lh
 
-    # ---------------------------------------------------------------
-    # FIXED: The error occurs because build 22G813 is NOT in ipsw.me API.
-    # Instead: query via AppleDB using: ipsw download appledb
-    # ---------------------------------------------------------------
+      - name: Create lab folder
+        run: mkdir -p kit/{kernel,dyld,bundle,sandbox,log}
 
-    - name: Query IPSW URL (AppleDB, not ipsw.me)
-      id: geturl
-      run: |
-        echo "Querying AppleDB for iPhone17,3 build 22G813…"
+      # ----------------------------------------------------
+      # Kernel kit
+      # ----------------------------------------------------
+      - name: Kernel kit
+        run: |
+          ipsw kernel symbolicate iPhone17,3_18.6_22G86_Restore.ipsw > kit/kernel/ksyms.txt
+          ipsw kernel kexts      iPhone17,3_18.6_22G86_Restore.ipsw > kit/kernel/kexts.txt
+          ipsw kernel syscall    iPhone17,3_18.6_22G86_Restore.ipsw > kit/kernel/syscalls.txt
+          ipsw kernel dec        iPhone17,3_18.6_22G86_Restore.ipsw -o kit/kernel/kernel.decompressed
 
-        ipsw download appledb --device iPhone17,3 --build 22G813 --urls > urls.txt
+      # ----------------------------------------------------
+      # AppleDNG + ImageIO
+      # ----------------------------------------------------
+      - name: Extract DNG + ImageIO
+        run: |
+          sudo ipsw mount fs iPhone17,3_18.6_22G86_Restore.ipsw /tmp/fs
+          sudo ls /tmp/fs/System/Library/CoreServices/RawCamera.bundle
 
-        URL=$(grep -Eo 'https://[a-zA-Z0-9./?=_:-]+' urls.txt | head -n1)
+          cp /tmp/fs/System/Library/CoreServices/RawCamera.bundle/AppleDNG kit/bundle/
 
-        if [ -z "$URL" ]; then
-          echo "❌ ERROR: AppleDB did not return a valid IPSW URL."
-          exit 1
-        fi
+          ipsw dyld extract -o kit/dyld iPhone17,3_18.6_22G86_Restore.ipsw ImageIO
+          jtool2 -S kit/dyld/ImageIO.dylib | grep -E '(serialize|getExternal)' > kit/dyld/ImageIO_gadgets.txt
 
-        echo "IPSW_URL=$URL" >> $GITHUB_ENV
+      # ----------------------------------------------------
+      # Sandbox + entitlements
+      # ----------------------------------------------------
+      - name: Sandbox & entitlements
+        run: |
+          cp /tmp/fs/usr/share/sandbox/*mediaanalysis* kit/sandbox/ || true
+          ipsw ent -b mediaanalysisd iPhone17,3_18.6_22G86_Restore.ipsw > kit/sandbox/mediaanalysisd.ent
 
-    - name: Download IPSW
-      run: |
-        curl -L "$IPSW_URL" -o firmware.ipsw
-        ls -lh firmware.ipsw
+      # ----------------------------------------------------
+      # IOSurface headers
+      # ----------------------------------------------------
+      - name: IOSurface headers
+        run: |
+          ipsw dyld objc -H -o kit/dyld/IOSurfaceRootUC.h \
+            iPhone17,3_18.6_22G86_Restore.ipsw IOSurfaceRootUserClient
 
-    - name: Extract kernel
-      run: |
-        mkdir -p out/kernel
-        ipsw extract --kernel firmware.ipsw -o out/kernel
+      # ----------------------------------------------------
+      # (Optional) Diff against another build — remove or update as needed
+      # ----------------------------------------------------
+      # - name: Patch-diff ...
+      #   run: |
+      #     ...
 
-    - name: Extract dyld_shared_cache
-      run: |
-        mkdir -p out/dyld
-        ipsw dyld extract firmware.ipsw -o out/dyld
+      # ----------------------------------------------------
+      # Zip kit
+      # ----------------------------------------------------
+      - name: Zip artefacts
+        run: |
+          tar -czf iPhone16_18.6_kit.tgz kit/
+          echo "KIT_SIZE=$(ls -lh iPhone16_18.6_kit.tgz | awk '{print $5}')" >> $GITHUB_ENV
 
-    - name: Package output
-      run: |
-        tar -czf ipsw_out.tgz out/
-
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ipsw-out
-        path: ipsw_out.tgz
+      # ----------------------------------------------------
+      # Upload artefact
+      # ----------------------------------------------------
+      - name: Upload artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iPhone16-18.6-kit
+          path: iPhone16_18.6_kit.tgz
+          retention-days: 7
