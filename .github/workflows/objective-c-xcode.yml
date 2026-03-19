@@ -36,7 +36,6 @@ jobs:
 
       - name: Kernel Analysis
         run: |
-          # Prefer the research kernelcache (more symbols); fall back to release.
           # All ipsw kernel subcommands take the extracted Mach-O, NOT the IPSW zip.
           KC=$(find kit/kernel -name 'kernelcache.research.*' | head -1)
           if [ -z "$KC" ]; then
@@ -45,8 +44,7 @@ jobs:
           echo "Using kernelcache: $KC"
           file "$KC"
 
-          # ipsw extract --kernel already produces a raw Mach-O.
-          # kernel dec is only needed for a still-wrapped im4p.
+          # ipsw extract --kernel already produces a raw Mach-O — skip dec.
           if file "$KC" | grep -q 'Mach-O'; then
             echo "Already a Mach-O — skipping kernel dec, copying directly"
             cp "$KC" kit/kernel/kernel.decompressed
@@ -61,7 +59,7 @@ jobs:
           ipsw kernel kexts   kit/kernel/kernel.decompressed > kit/kernel/kexts.txt
           ipsw kernel syscall kit/kernel/kernel.decompressed > kit/kernel/syscalls.txt
 
-          # symbolicate accepts either; IPSW gives it access to signatures
+          # symbolicate accepts the IPSW to pull signatures
           ipsw kernel symbolicate \
             firmware/iPhone17,3_18.6_22G86_Restore.ipsw \
             --output kit/kernel || \
@@ -75,34 +73,45 @@ jobs:
             firmware/iPhone17,3_18.6_22G86_Restore.ipsw \
             --output kit/dyld
 
-      # ── JSC: Mount DMG and extract JavaScriptCore binary ──────────────────
+      # ── JSC: Extract root filesystem DMG and copy JavaScriptCore ──────────
       - name: Mount DMG and Extract JavaScriptCore
         run: |
-          mkdir -p kit/jsc
+          mkdir -p kit/jsc kit/dmg
           IPSW=firmware/iPhone17,3_18.6_22G86_Restore.ipsw
 
-          # List all DMGs inside the IPSW zip; pick the largest (root filesystem)
-          unzip -l "$IPSW" | grep '\.dmg' | awk '{print $NF}' > /tmp/dmg_list.txt
-          echo "=== DMGs in IPSW ===" && cat /tmp/dmg_list.txt
+          # Use ipsw to extract the plain (unencrypted) DMG — avoids .aea files
+          # which are Apple Encrypted Archives and cannot be mounted directly.
+          # The largest plain .dmg is the root filesystem.
+          ipsw extract --dmg "$IPSW" --output kit/dmg
+          echo "=== Extracted DMGs ===" && ls -lh kit/dmg/
 
-          ROOTFS_DMG=$(unzip -l "$IPSW" | grep '\.dmg' \
-            | sort -k1 -rn | head -1 | awk '{print $NF}')
-          echo "Extracting DMG: $ROOTFS_DMG"
-          unzip -o "$IPSW" "$ROOTFS_DMG" -d /tmp/ipsw_dmg/
+          # Pick the largest plain .dmg (root filesystem, not cryptex or update)
+          ROOTFS_DMG=$(find kit/dmg -name '*.dmg' ! -name '*.aea' \
+            | xargs ls -S 2>/dev/null | head -1)
+          echo "Root filesystem DMG: $ROOTFS_DMG"
 
-          # Mount read-only; capture the mount point
-          MOUNT_OUT=$(hdiutil attach -readonly -nobrowse \
-            "/tmp/ipsw_dmg/$ROOTFS_DMG" 2>&1)
+          if [ -z "$ROOTFS_DMG" ]; then
+            echo "ERROR: no plain .dmg found after extraction" && exit 1
+          fi
+
+          # Mount read-only
+          MOUNT_OUT=$(hdiutil attach -readonly -nobrowse "$ROOTFS_DMG" 2>&1)
           echo "$MOUNT_OUT"
           MOUNT_PT=$(echo "$MOUNT_OUT" | awk '/\/Volumes\// {print $NF}' | head -1)
           echo "Mounted at: $MOUNT_PT"
+
+          if [ -z "$MOUNT_PT" ]; then
+            echo "ERROR: hdiutil attach failed or mount point not found" && exit 1
+          fi
 
           JSC_SRC="$MOUNT_PT/System/Library/Frameworks/JavaScriptCore.framework/JavaScriptCore"
           if [ -f "$JSC_SRC" ]; then
             cp "$JSC_SRC" kit/jsc/JavaScriptCore
             echo "Copied $(wc -c < kit/jsc/JavaScriptCore) bytes"
           else
-            echo "ERROR: JavaScriptCore not found at expected path" && exit 1
+            echo "JavaScriptCore not at primary path — scanning mount"
+            find "$MOUNT_PT" -name 'JavaScriptCore' -not -name '*.h' 2>/dev/null | head -5
+            echo "ERROR: JavaScriptCore not found" && exit 1
           fi
 
           hdiutil detach "$MOUNT_PT" || true
