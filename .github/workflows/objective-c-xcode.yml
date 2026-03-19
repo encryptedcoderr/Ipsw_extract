@@ -59,11 +59,9 @@ jobs:
           ipsw kernel kexts   kit/kernel/kernel.decompressed > kit/kernel/kexts.txt
           ipsw kernel syscall kit/kernel/kernel.decompressed > kit/kernel/syscalls.txt
 
-          # symbolicate accepts the IPSW to pull signatures
-          ipsw kernel symbolicate \
-            firmware/iPhone17,3_18.6_22G86_Restore.ipsw \
-            --output kit/kernel || \
-            echo "Symbolication skipped (no matching signatures available)"
+          # symbolicate requires a --signatures folder that doesn't exist for
+          # this build yet — skip cleanly rather than erroring
+          echo "Symbolication skipped: no public signature pack for 18.6/22G86"
 
       - name: Extract dyld_shared_cache
         run: |
@@ -73,65 +71,55 @@ jobs:
             firmware/iPhone17,3_18.6_22G86_Restore.ipsw \
             --output kit/dyld
 
-      # ── JSC: Extract root filesystem DMG and copy JavaScriptCore ──────────
-      - name: Mount DMG and Extract JavaScriptCore
+      # ── JSC: extract directly from dyld_shared_cache ───────────────────────
+      # The dyld_shared_cache already contains JavaScriptCore as a mapped image.
+      # ipsw dyld extract pulls it out without needing to mount any DMG or deal
+      # with AEA encryption — the dyld step above already handled decryption.
+      - name: Extract JavaScriptCore from dyld_shared_cache
         run: |
-          mkdir -p kit/jsc kit/dmg
-          IPSW=firmware/iPhone17,3_18.6_22G86_Restore.ipsw
+          mkdir -p kit/jsc
 
-          # Use ipsw to extract the plain (unencrypted) DMG — avoids .aea files
-          # which are Apple Encrypted Archives and cannot be mounted directly.
-          # The largest plain .dmg is the root filesystem.
-          ipsw extract --dmg "$IPSW" --output kit/dmg
-          echo "=== Extracted DMGs ===" && ls -lh kit/dmg/
-
-          # Pick the largest plain .dmg (root filesystem, not cryptex or update)
-          ROOTFS_DMG=$(find kit/dmg -name '*.dmg' ! -name '*.aea' \
-            | xargs ls -S 2>/dev/null | head -1)
-          echo "Root filesystem DMG: $ROOTFS_DMG"
-
-          if [ -z "$ROOTFS_DMG" ]; then
-            echo "ERROR: no plain .dmg found after extraction" && exit 1
+          # Locate the primary cache file (no numeric suffix)
+          DSC=$(find kit/dyld -name 'dyld_shared_cache_arm64e' ! -name '*.symbols' \
+            | grep -v '\.' | head -1)
+          # Fallback: any arm64e cache
+          if [ -z "$DSC" ]; then
+            DSC=$(find kit/dyld -name 'dyld_shared_cache_arm64e' | head -1)
           fi
+          echo "Using dyld_shared_cache: $DSC"
 
-          # Mount read-only
-          MOUNT_OUT=$(hdiutil attach -readonly -nobrowse "$ROOTFS_DMG" 2>&1)
-          echo "$MOUNT_OUT"
-          MOUNT_PT=$(echo "$MOUNT_OUT" | awk '/\/Volumes\// {print $NF}' | head -1)
-          echo "Mounted at: $MOUNT_PT"
+          # Extract JavaScriptCore as a standalone Mach-O
+          ipsw dyld extract "$DSC" \
+            --dylib JavaScriptCore \
+            --output kit/jsc/ || {
+            # Fallback: use full framework path if short name fails
+            ipsw dyld extract "$DSC" \
+              --dylib '/System/Library/Frameworks/JavaScriptCore.framework/JavaScriptCore' \
+              --output kit/jsc/
+          }
 
-          if [ -z "$MOUNT_PT" ]; then
-            echo "ERROR: hdiutil attach failed or mount point not found" && exit 1
-          fi
-
-          JSC_SRC="$MOUNT_PT/System/Library/Frameworks/JavaScriptCore.framework/JavaScriptCore"
-          if [ -f "$JSC_SRC" ]; then
-            cp "$JSC_SRC" kit/jsc/JavaScriptCore
-            echo "Copied $(wc -c < kit/jsc/JavaScriptCore) bytes"
-          else
-            echo "JavaScriptCore not at primary path — scanning mount"
-            find "$MOUNT_PT" -name 'JavaScriptCore' -not -name '*.h' 2>/dev/null | head -5
-            echo "ERROR: JavaScriptCore not found" && exit 1
-          fi
-
-          hdiutil detach "$MOUNT_PT" || true
+          echo "=== Extracted JSC files ===" && ls -lh kit/jsc/
+          file kit/jsc/JavaScriptCore 2>/dev/null || \
+            file kit/jsc/*.dylib 2>/dev/null || true
 
       # ── bmalloc allocator analysis ─────────────────────────────────────────
       - name: bmalloc Allocator Analysis
         run: |
-          JSC=kit/jsc/JavaScriptCore
-
+          # Accept either .dylib or no-extension depending on how ipsw named it
+          JSC=$(find kit/jsc -name 'JavaScriptCore*' ! -name '*.txt' | head -1)
+          echo "Analysing: $JSC"
           file "$JSC"
           lipo -info "$JSC" 2>/dev/null || true
 
-          # Extract arm64 slice if fat binary
-          if lipo -info "$JSC" 2>/dev/null | grep -q arm64; then
-            lipo -extract arm64 "$JSC" -output kit/jsc/JavaScriptCore.arm64 2>/dev/null || \
-              cp "$JSC" kit/jsc/JavaScriptCore.arm64
+          # Extract arm64e slice — JSC in the cache is arm64e only, but be safe
+          if lipo -info "$JSC" 2>/dev/null | grep -qE 'arm64e?'; then
+            lipo -extract arm64e "$JSC" -output kit/jsc/JavaScriptCore.arm64e 2>/dev/null || \
+            lipo -extract arm64  "$JSC" -output kit/jsc/JavaScriptCore.arm64e 2>/dev/null || \
+              cp "$JSC" kit/jsc/JavaScriptCore.arm64e
           else
-            cp "$JSC" kit/jsc/JavaScriptCore.arm64
+            cp "$JSC" kit/jsc/JavaScriptCore.arm64e
           fi
-          JSC=kit/jsc/JavaScriptCore.arm64
+          JSC=kit/jsc/JavaScriptCore.arm64e
 
           echo "=== bmalloc symbols ===" > kit/jsc/bmalloc_analysis.txt
           nm -gU "$JSC" 2>/dev/null \
@@ -153,7 +141,7 @@ jobs:
       # ── JSArrayBuffer struct layout ────────────────────────────────────────
       - name: JSArrayBuffer Struct Layout
         run: |
-          JSC=kit/jsc/JavaScriptCore.arm64
+          JSC=kit/jsc/JavaScriptCore.arm64e
 
           echo "=== JSArrayBuffer m_data offset analysis ===" \
             > kit/jsc/jsarraybuffer_layout.txt
