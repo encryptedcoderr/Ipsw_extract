@@ -44,11 +44,23 @@ jobs:
             KC=$(find kit/kernel -name 'kernelcache.release.*' | head -1)
           fi
           echo "Using kernelcache: $KC"
+          file "$KC"
 
-          # Decompress the already-extracted kernelcache file — NOT the IPSW
-          ipsw kernel dec "$KC" --output kit/kernel/kernel.decompressed
+          # ipsw extract --kernel already produces a raw Mach-O.
+          # kernel dec is only needed for a still-wrapped im4p pulled directly
+          # from the zip. Detect and skip to avoid the ASN.1 / length-too-large error.
+          if file "$KC" | grep -q 'Mach-O'; then
+            echo "Already a Mach-O — skipping kernel dec, copying directly"
+            cp "$KC" kit/kernel/kernel.decompressed
+          else
+            echo "img4/im4p wrapped — decompressing"
+            ipsw kernel dec "$KC" --output kit/kernel/kernel.decompressed
+          fi
 
-          # kexts and syscalls take the IPSW path (these subcommands unpack internally)
+          # Confirm the result is a valid Mach-O before proceeding
+          file kit/kernel/kernel.decompressed
+
+          # kexts, syscall, and symbolicate take the IPSW path directly
           ipsw kernel kexts   "$IPSW" > kit/kernel/kexts.txt
           ipsw kernel syscall "$IPSW" > kit/kernel/syscalls.txt
 
@@ -153,7 +165,7 @@ jobs:
             | grep 'JSArrayBuffer' \
             >> kit/jsc/jsarraybuffer_layout.txt || true
 
-          # Store/load offsets in the 0x40–0x80 byte range (brackets m_data at word 64)
+          # Store/load offsets in the 0x40–0x100 byte range (brackets m_data at word 64)
           echo "=== Offsets 0x40..0x100 in JSArrayBuffer context ===" \
             >> kit/jsc/jsarraybuffer_layout.txt
           jtool2 -d "$JSC" 2>/dev/null \
