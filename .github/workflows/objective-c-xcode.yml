@@ -59,8 +59,7 @@ jobs:
           ipsw kernel kexts   kit/kernel/kernel.decompressed > kit/kernel/kexts.txt
           ipsw kernel syscall kit/kernel/kernel.decompressed > kit/kernel/syscalls.txt
 
-          # symbolicate requires a --signatures folder that doesn't exist for
-          # this build yet — skip cleanly rather than erroring
+          # No public signature pack for 18.6/22G86 yet
           echo "Symbolication skipped: no public signature pack for 18.6/22G86"
 
       - name: Extract dyld_shared_cache
@@ -72,46 +71,44 @@ jobs:
             --output kit/dyld
 
       # ── JSC: extract directly from dyld_shared_cache ───────────────────────
-      # The dyld_shared_cache already contains JavaScriptCore as a mapped image.
-      # ipsw dyld extract pulls it out without needing to mount any DMG or deal
-      # with AEA encryption — the dyld step above already handled decryption.
+      # DYLIB is a positional argument: ipsw dyld extract <DSC> <DYLIB> -o <dir>
       - name: Extract JavaScriptCore from dyld_shared_cache
         run: |
           mkdir -p kit/jsc
 
-          # Locate the primary cache file (no numeric suffix)
-          DSC=$(find kit/dyld -name 'dyld_shared_cache_arm64e' ! -name '*.symbols' \
-            | grep -v '\.' | head -1)
-          # Fallback: any arm64e cache
+          # Locate the primary cache file (no numeric suffix, no .symbols)
+          DSC=$(find kit/dyld -name 'dyld_shared_cache_arm64e' \
+            ! -name '*.symbols' ! -name '*.*' | head -1)
+          # Fallback: first arm64e cache regardless of extension
           if [ -z "$DSC" ]; then
             DSC=$(find kit/dyld -name 'dyld_shared_cache_arm64e' | head -1)
           fi
           echo "Using dyld_shared_cache: $DSC"
 
-          # Extract JavaScriptCore as a standalone Mach-O
+          # Positional: <DSC> <DYLIB> -o <output dir>
+          # Try short name first, then full framework path
           ipsw dyld extract "$DSC" \
-            --dylib JavaScriptCore \
-            --output kit/jsc/ || {
-            # Fallback: use full framework path if short name fails
-            ipsw dyld extract "$DSC" \
-              --dylib '/System/Library/Frameworks/JavaScriptCore.framework/JavaScriptCore' \
-              --output kit/jsc/
-          }
+            JavaScriptCore \
+            --output kit/jsc/ \
+            --force || \
+          ipsw dyld extract "$DSC" \
+            '/System/Library/Frameworks/JavaScriptCore.framework/JavaScriptCore' \
+            --output kit/jsc/ \
+            --force
 
           echo "=== Extracted JSC files ===" && ls -lh kit/jsc/
           file kit/jsc/JavaScriptCore 2>/dev/null || \
-            file kit/jsc/*.dylib 2>/dev/null || true
+            find kit/jsc -type f | head -10
 
       # ── bmalloc allocator analysis ─────────────────────────────────────────
       - name: bmalloc Allocator Analysis
         run: |
-          # Accept either .dylib or no-extension depending on how ipsw named it
-          JSC=$(find kit/jsc -name 'JavaScriptCore*' ! -name '*.txt' | head -1)
+          JSC=$(find kit/jsc -type f ! -name '*.txt' | head -1)
           echo "Analysing: $JSC"
           file "$JSC"
           lipo -info "$JSC" 2>/dev/null || true
 
-          # Extract arm64e slice — JSC in the cache is arm64e only, but be safe
+          # Extract arm64e slice
           if lipo -info "$JSC" 2>/dev/null | grep -qE 'arm64e?'; then
             lipo -extract arm64e "$JSC" -output kit/jsc/JavaScriptCore.arm64e 2>/dev/null || \
             lipo -extract arm64  "$JSC" -output kit/jsc/JavaScriptCore.arm64e 2>/dev/null || \
