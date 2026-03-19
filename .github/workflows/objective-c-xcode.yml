@@ -1,69 +1,62 @@
 name: IPSW Extraction Workflow
-
 on:
   workflow_dispatch:
 
 jobs:
   extract:
     runs-on: macos-latest
-
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Install Tools
+        run: brew install ipsw
 
-    - name: Install Tools
-      run: |
-        brew install ipsw
-        brew tap excitedplus1s/repo
-        brew install excitedplus1s/repo/jtool2 || true
+      - name: Download IPSW
+        run: |
+          mkdir -p firmware
+          curl -L \
+            "https://updates.cdn-apple.com/2025SummerFCS/fullrestores/082-98952/853D36FA-A5F4-4B75-B5F3-8D38430F6132/iPhone17,3_18.6_22G86_Restore.ipsw" \
+            -o firmware/iPhone17,3_18.6_22G86_Restore.ipsw
+          ls -lh firmware
 
-    - name: Download IPSW (Direct URL)
-      run: |
-        mkdir -p firmware
-        curl -L \
-        "https://updates.cdn-apple.com/2025SummerFCS/fullrestores/082-98952/853D36FA-A5F4-4B75-B5F3-8D38430F6132/iPhone17,3_18.6_22G86_Restore.ipsw" \
-        -o firmware/iPhone17,3_18.6_22G86_Restore.ipsw
-        ls -lh firmware
+      - name: Extract Kernel
+        run: |
+          mkdir -p kit/kernel
+          ipsw extract \
+            --kernel \
+            firmware/iPhone17,3_18.6_22G86_Restore.ipsw \
+            --output kit/kernel
 
-    - name: Extract Kernel
-      run: |
-        mkdir -p kit/kernel
-        ipsw extract \
-          --kernel firmware/iPhone17,3_18.6_22G86_Restore.ipsw \
-          -o kit/kernel
+      - name: Kernel Analysis
+        run: |
+          IPSW=firmware/iPhone17,3_18.6_22G86_Restore.ipsw
 
-    - name: Kernel Symbolicate
-      run: |
-        # Use the extracted kernel folder as signatures
-        mkdir -p sigs
-        cp -R kit/kernel/* sigs/
+          # Decompress kernel to a file (not a dir)
+          ipsw kernel dec "$IPSW" --output kit/kernel/kernel.decompressed
 
-        ipsw kernel symbolicate \
-          --signatures sigs \
-          firmware/iPhone17,3_18.6_22G86_Restore.ipsw \
-          -o kit/kernel
+          # List kexts and syscalls
+          ipsw kernel kexts   "$IPSW" > kit/kernel/kexts.txt
+          ipsw kernel syscall "$IPSW" > kit/kernel/syscalls.txt
 
-        ipsw kernel kexts firmware/iPhone17,3_18.6_22G86_Restore.ipsw > kit/kernel/kexts.txt
-        ipsw kernel syscall firmware/iPhone17,3_18.6_22G86_Restore.ipsw > kit/kernel/syscalls.txt
+          # Symbolicate using blacktop's hosted signatures (downloads automatically)
+          ipsw kernel symbolicate "$IPSW" --output kit/kernel || \
+            echo "Symbolication skipped (no matching signatures available)"
 
-        ipsw kernel dec \
-          firmware/iPhone17,3_18.6_22G86_Restore.ipsw \
-          -o kit/kernel/kernel.decompressed
+      - name: Extract dyld_shared_cache
+        run: |
+          mkdir -p kit/dyld
+          # --dyld flag extracts the dyld_shared_cache file(s) from the IPSW
+          ipsw extract \
+            --dyld \
+            firmware/iPhone17,3_18.6_22G86_Restore.ipsw \
+            --output kit/dyld
 
-    - name: Extract dyld_shared_cache
-      run: |
-        mkdir -p kit/dyld
-        ipsw dyld extract \
-          firmware/iPhone17,3_18.6_22G86_Restore.ipsw \
-          -o kit/dyld
+      - name: Package Output
+        run: tar -czf ipsw_out.tgz kit/
 
-    - name: Package output
-      run: |
-        tar -czf ipsw_out.tgz kit/
-
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ipsw-out
-        path: ipsw_out.tgz
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipsw-out
+          path: ipsw_out.tgz
