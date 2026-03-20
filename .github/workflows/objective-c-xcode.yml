@@ -17,23 +17,20 @@ jobs:
           # jtool2 is not in homebrew core — pull the binary directly
           curl -L https://newosxbook.com/tools/jtool2.tgz | tar -xz -C /usr/local/bin jtool2
           chmod +x /usr/local/bin/jtool2
-
       - name: Download IPSW
         run: |
           mkdir -p firmware
           curl -L \
-            "https://updates.cdn-apple.com/2025SummerFCS/fullrestores/082-98952/853D36FA-A5F4-4B75-B5F3-8D38430F6132/iPhone17,3_18.6_22G86_Restore.ipsw" \
-            -o firmware/iPhone17,3_18.6_22G86_Restore.ipsw
+            "https://updates.cdn-apple.com/2025SpringFCS/fullrestores/082-30380/AD76C77E-51AA-4D55-A074-9C0E7545D784/iPhone17,3_18.4.1_22E252_Restore.ipsw" \
+            -o firmware/iPhone17,3_18.4.1_22E252_Restore
           ls -lh firmware
-
       - name: Extract Kernel
         run: |
           mkdir -p kit/kernel
           ipsw extract \
             --kernel \
-            firmware/iPhone17,3_18.6_22G86_Restore.ipsw \
+            firmware/iPhone17,3_18.4.1_22E252_Restore.ipsw \
             --output kit/kernel
-
       - name: Kernel Analysis
         run: |
           # All ipsw kernel subcommands take the extracted Mach-O, NOT the IPSW zip.
@@ -43,7 +40,6 @@ jobs:
           fi
           echo "Using kernelcache: $KC"
           file "$KC"
-
           # ipsw extract --kernel already produces a raw Mach-O — skip dec.
           if file "$KC" | grep -q 'Mach-O'; then
             echo "Already a Mach-O — skipping kernel dec, copying directly"
@@ -52,30 +48,24 @@ jobs:
             echo "img4/im4p wrapped — decompressing"
             ipsw kernel dec "$KC" --output kit/kernel/kernel.decompressed
           fi
-
           file kit/kernel/kernel.decompressed
-
           # kexts and syscall take the extracted kernelcache, not the IPSW zip
           ipsw kernel kexts   kit/kernel/kernel.decompressed > kit/kernel/kexts.txt
           ipsw kernel syscall kit/kernel/kernel.decompressed > kit/kernel/syscalls.txt
-
           # No public signature pack for 18.6/22G86 yet
           echo "Symbolication skipped: no public signature pack for 18.6/22G86"
-
       - name: Extract dyld_shared_cache
         run: |
           mkdir -p kit/dyld
           ipsw extract \
             --dyld \
-            firmware/iPhone17,3_18.6_22G86_Restore.ipsw \
+            firmware/iPhone17,3_18.4.1_22E252_Restore.ipsw \
             --output kit/dyld
-
       # ── JSC: extract directly from dyld_shared_cache ───────────────────────
       # DYLIB is a positional argument: ipsw dyld extract <DSC> <DYLIB> -o <dir>
       - name: Extract JavaScriptCore from dyld_shared_cache
         run: |
           mkdir -p kit/jsc
-
           # Locate the primary cache file (no numeric suffix, no .symbols)
           DSC=$(find kit/dyld -name 'dyld_shared_cache_arm64e' \
             ! -name '*.symbols' ! -name '*.*' | head -1)
@@ -84,7 +74,6 @@ jobs:
             DSC=$(find kit/dyld -name 'dyld_shared_cache_arm64e' | head -1)
           fi
           echo "Using dyld_shared_cache: $DSC"
-
           # Positional: <DSC> <DYLIB> -o <output dir>
           # Try short name first, then full framework path
           ipsw dyld extract "$DSC" \
@@ -95,11 +84,9 @@ jobs:
             '/System/Library/Frameworks/JavaScriptCore.framework/JavaScriptCore' \
             --output kit/jsc/ \
             --force
-
           echo "=== Extracted JSC files ===" && ls -lh kit/jsc/
           file kit/jsc/JavaScriptCore 2>/dev/null || \
             find kit/jsc -type f | head -10
-
       # ── bmalloc allocator analysis ─────────────────────────────────────────
       - name: bmalloc Allocator Analysis
         run: |
@@ -107,7 +94,6 @@ jobs:
           echo "Analysing: $JSC"
           file "$JSC"
           lipo -info "$JSC" 2>/dev/null || true
-
           # Extract arm64e slice
           if lipo -info "$JSC" 2>/dev/null | grep -qE 'arm64e?'; then
             lipo -extract arm64e "$JSC" -output kit/jsc/JavaScriptCore.arm64e 2>/dev/null || \
@@ -117,70 +103,55 @@ jobs:
             cp "$JSC" kit/jsc/JavaScriptCore.arm64e
           fi
           JSC=kit/jsc/JavaScriptCore.arm64e
-
           echo "=== bmalloc symbols ===" > kit/jsc/bmalloc_analysis.txt
           nm -gU "$JSC" 2>/dev/null \
             | grep -iE 'bmalloc|LargeChunk|heapKind|SmallChunk|MediumChunk|Heap::' \
             >> kit/jsc/bmalloc_analysis.txt || true
-
           echo "=== Region-size constants (0x10000 / 65536) ===" >> kit/jsc/bmalloc_analysis.txt
           jtool2 -d "$JSC" 2>/dev/null \
             | grep -E '#0x10000|#65536|#0x8000|heapBase|LargeChunk' \
             >> kit/jsc/bmalloc_analysis.txt || true
-
           echo "=== High-address constants (0xFF.*) ===" >> kit/jsc/bmalloc_analysis.txt
           jtool2 -d "$JSC" 2>/dev/null \
             | grep -E '#0xFF[0-9A-Fa-f]{6}' \
             >> kit/jsc/bmalloc_analysis.txt || true
-
           cat kit/jsc/bmalloc_analysis.txt
-
       # ── JSArrayBuffer struct layout ────────────────────────────────────────
       - name: JSArrayBuffer Struct Layout
         run: |
           JSC=kit/jsc/JavaScriptCore.arm64e
-
           echo "=== JSArrayBuffer m_data offset analysis ===" \
             > kit/jsc/jsarraybuffer_layout.txt
-
           jtool2 -d "$JSC" 2>/dev/null \
             | grep -A 60 'JSArrayBuffer' \
             | grep -E 'str|ldr|stp|ldp|m_data|offset|0x[0-9a-f]{1,3}\]' \
             >> kit/jsc/jsarraybuffer_layout.txt || true
-
           echo "=== JSArrayBuffer symbols ===" >> kit/jsc/jsarraybuffer_layout.txt
           nm -gU "$JSC" 2>/dev/null \
             | grep 'JSArrayBuffer' \
             >> kit/jsc/jsarraybuffer_layout.txt || true
-
           echo "=== Offsets 0x40..0x100 in JSArrayBuffer context ===" \
             >> kit/jsc/jsarraybuffer_layout.txt
           jtool2 -d "$JSC" 2>/dev/null \
             | grep -A 80 'JSArrayBuffer' \
             | grep -E '\[x[0-9]+, #0x[3-9][0-9a-f]\]|\[x[0-9]+, #0x[1-9][0-9a-f]{2}\]' \
             >> kit/jsc/jsarraybuffer_layout.txt || true
-
           cat kit/jsc/jsarraybuffer_layout.txt
-
       # ── idevicesyslog methodology (USB-only, documented for local use) ─────
       - name: Document idevicesyslog Methodology
         run: |
           cat > kit/jsc/idevicesyslog_method.txt << 'EOF'
           USB-only — not executed in CI.
-
           Prerequisites:
             brew install libimobiledevice
             idevicepair pair        # device must trust this host
-
           Capture command:
             idevicesyslog \
               | grep -E 'GC.*heap|0xFF[A-F0-9]{6}' \
               | tee kit/jsc/gc_heap_log.txt
-
           What to look for:
             [JSC] GC: heap region 0xFFCB0000 size 0x10000
               → confirms CRITICAL3 heap base and 64 KiB region granularity
-
           Interpretation:
             Stable 0xFFCBxxxx across sessions:
               Allocator uses a fixed high-address preference;
@@ -189,7 +160,6 @@ jobs:
               ASLR range is wide; offset must be probed per-run.
           EOF
           cat kit/jsc/idevicesyslog_method.txt
-
       - name: Package Output
         run: tar -czf ipsw_out.tgz kit/
 
