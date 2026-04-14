@@ -1,18 +1,15 @@
-name: IPSW Extraction Workflow (iOS 18.4.1)
+name: IPSW Extraction Workflow (Improved)
 
 on:
   workflow_dispatch:
     inputs:
       device_model:
-        description: 'Device Model (e.g., iPhone17,3)'
         required: true
         default: 'iPhone17,3'
       build_number:
-        description: 'Build Number (e.g., 22E252)'
         required: true
         default: '22E252'
       ios_version:
-        description: 'iOS Version (e.g., 18.4.1)'
         required: true
         default: '18.4.1'
 
@@ -21,117 +18,107 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install Tools
         run: |
-          brew install ipsw
+          brew install ipsw radare2
           curl -L https://newosxbook.com/tools/jtool2.tgz -o /tmp/jtool2.tgz
           tar -xzf /tmp/jtool2.tgz -C /tmp
           sudo mv /tmp/jtool2 /usr/local/bin/
           chmod +x /usr/local/bin/jtool2
-          brew install radare2
 
       - name: Download IPSW
         run: |
           mkdir -p firmware
           URL="https://updates.cdn-apple.com/2025SpringFCS/fullrestores/082-30380/AD76C77E-51AA-4D55-A074-9C0E7545D784/${{ github.event.inputs.device_model }}_${{ github.event.inputs.ios_version }}_${{ github.event.inputs.build_number }}_Restore.ipsw"
-          echo "Downloading from: $URL"
-          curl -L --retry 3 --retry-delay 2 -o firmware/device.ipsw "$URL"
-          ls -lh firmware/device.ipsw
-          if [ ! -s firmware/device.ipsw ]; then
-            echo "ERROR: IPSW download failed"
-            exit 1
-          fi
+          echo "Downloading: $URL"
+          curl -L --retry 3 -o firmware/device.ipsw "$URL"
 
-      - name: Extract Kernel and dyld_shared_cache
+      - name: Extract Kernel + dyld
         run: |
           mkdir -p kit/kernel kit/dyld
           ipsw extract --kernel firmware/device.ipsw --output kit/kernel
           ipsw extract --dyld firmware/device.ipsw --output kit/dyld
 
-      - name: Reassemble dyld_shared_cache
+      - name: Reassemble dyld cache
         run: |
-          CACHE_DIR=$(find kit/dyld -type d -name "*${{ github.event.inputs.build_number }}*" | head -1)
+          CACHE_DIR=$(find kit/dyld -type d | head -1)
           cd "$CACHE_DIR"
 
-          if ls dyld_shared_cache_arm64e.?? 2>/dev/null; then
-            cat dyld_shared_cache_arm64e.?? > dyld_shared_cache_arm64e.combined
+          if ls dyld_shared_cache_arm64e.* 1>/dev/null 2>&1; then
+            cat dyld_shared_cache_arm64e.* > combined
+            mv combined dyld_shared_cache_arm64e.combined
           fi
 
-          cd ..
-          DSC=$(find . -name "dyld_shared_cache_arm64e" -type f ! -name "*.combined" | head -1)
-          if [ -n "$DSC" ]; then
-            ipsw dyld symbols "$DSC" > dyld_symbols.txt 2>/dev/null || true
-          fi
-
-      - name: Extract Frameworks
+      - name: Locate dyld cache
         run: |
-          CACHE_DIR=$(find kit/dyld -type d -name "*${{ github.event.inputs.build_number }}*" | head -1)
-          DSC=$(find "$CACHE_DIR" -name "dyld_shared_cache_arm64e" -type f ! -name "*.combined" | head -1)
+          DSC=$(find kit/dyld -name "*arm64e*" | head -1)
+          echo "DSC=$DSC" >> $GITHUB_ENV
+          echo "Using cache: $DSC"
 
-          if [ -z "$DSC" ]; then
-            DSC="$CACHE_DIR/dyld_shared_cache_arm64e.combined"
-          fi
-
-          mkdir -p kit/jsc kit/webcore kit/avfaudio kit/dyld_bin
-
-          ipsw dyld extract "$DSC" "JavaScriptCore" --output kit/jsc/ --force || true
-          ipsw dyld extract "$DSC" "WebCore" --output kit/webcore/ --force || true
-          ipsw dyld extract "$DSC" "AVFAudio" --output kit/avfaudio/ --force || true
-          ipsw dyld extract "$DSC" "/usr/lib/dyld" --output kit/dyld_bin/ --force || true
-
-      - name: Extract Offsets
+      - name: Extract frameworks (best effort)
         run: |
-          CACHE_DIR=$(find kit/dyld -type d -name "*${{ github.event.inputs.build_number }}*" | head -1)
-          SYMBOLS="$CACHE_DIR/dyld_shared_cache_arm64e.symbols"
+          mkdir -p kit/fw
+          ipsw dyld extract "$DSC" "JavaScriptCore" --output kit/fw || true
+          ipsw dyld extract "$DSC" "WebCore" --output kit/fw || true
+          ipsw dyld extract "$DSC" "AVFAudio" --output kit/fw || true
 
-          echo "=== Offsets ===" > kit/offsets.txt
+      # 🔥 MUCH BETTER SYMBOL HARVEST
+      - name: Build offsets.txt (multi-source)
+        run: |
+          echo "=== SYMBOL DUMP ===" > kit/offsets.txt
 
-          if [ -f "$SYMBOLS" ]; then
-            grep -E "ParseFloat|jitAllowList|Worker|AVSpeech|dlopen" "$SYMBOLS" >> kit/offsets.txt || true
-          fi
+          echo "[dyld strings]" >> kit/offsets.txt
+          strings "$DSC" | grep -E "ParseFloat|jit|AVSpeech|dlopen" >> kit/offsets.txt || true
 
-          for dir in jsc webcore avfaudio; do
-            FW=$(find kit/$dir -type f | head -1)
-            if [ -f "$FW" ]; then
-              nm -gU "$FW" 2>/dev/null | grep -E "ParseFloat|jitAllowList|Worker|AVSpeech" >> kit/offsets.txt || true
-            fi
+          echo "" >> kit/offsets.txt
+          echo "[jtool2 symbols]" >> kit/offsets.txt
+          jtool2 -S "$DSC" 2>/dev/null | grep -E "ParseFloat|jit|AVSpeech|dlopen" >> kit/offsets.txt || true
+
+          echo "" >> kit/offsets.txt
+          echo "[framework nm]" >> kit/offsets.txt
+
+          for f in $(find kit/fw -type f); do
+            echo "--- $f ---" >> kit/offsets.txt
+            nm "$f" 2>/dev/null | grep -E "ParseFloat|jit|AVSpeech|dlopen" >> kit/offsets.txt || true
           done
 
-      # ✅ FIXED STEP
-      - name: Parse Offsets and Generate rce_offsets Entry
+      # 🔍 DEBUG VISIBILITY
+      - name: DEBUG offsets.txt
         run: |
-          cat > kit/parse_and_generate.py << 'PYTHON'
+          echo "=========== OFFSETS CONTENT ==========="
+          head -200 kit/offsets.txt || echo "NO FILE"
+          echo "======================================"
+
+      # ✅ FIXED + IMPROVED PARSER
+      - name: Parse + Generate rce_offsets
+        run: |
+          cat > kit/parse.py << 'PYTHON'
           import re, os, json
 
-          def parse_offsets(path):
-              offsets = {}
-              if not os.path.exists(path):
-                  return offsets
+          data = open("kit/offsets.txt").read()
 
-              data = open(path).read()
+          patterns = {
+              "JavaScriptCore__ParseFloat": r'([0-9a-f]{8,16}).*ParseFloat',
+              "JavaScriptCore__jit": r'([0-9a-f]{8,16}).*jit',
+              "AVFAudio__AVSpeech": r'([0-9a-f]{8,16}).*AVSpeech',
+              "dyld__dlopen": r'([0-9a-f]{8,16}).*dlopen',
+          }
 
-              patterns = {
-                  "JavaScriptCore__globalFuncParseFloat": r'globalFuncParseFloat.*?([0-9a-f]{8,16})',
-                  "JavaScriptCore__jitAllowList": r'jitAllowList.*?([0-9a-f]{8,16})',
-                  "AVFAudio__AVSpeech": r'AVSpeech.*?([0-9a-f]{8,16})',
-                  "dyld__dlopen": r'dlopen.*?([0-9a-f]{8,16})',
-              }
+          offsets = {}
 
-              for k, p in patterns.items():
-                  m = re.search(p, data, re.I)
-                  if m:
-                      offsets[k] = f"0x{m.group(1)}n"
+          for k, p in patterns.items():
+              m = re.search(p, data, re.I)
+              if m:
+                  offsets[k] = f"0x{m.group(1)}n"
+                  print(f"[FOUND] {k} -> {offsets[k]}")
+              else:
+                  print(f"[MISS] {k}")
 
-              return offsets
-
-          offsets = parse_offsets("kit/offsets.txt")
-
-          device = os.environ.get("DEVICE_MODEL")
-          ios = os.environ.get("IOS_VERSION")
-          build = os.environ.get("BUILD_NUMBER")
+          device = os.environ["DEVICE_MODEL"]
+          ios = os.environ["IOS_VERSION"]
+          build = os.environ["BUILD_NUMBER"]
 
           key = f"{device}_{ios}_{build}".replace(".", "_")
 
@@ -139,21 +126,21 @@ jobs:
 
           open("kit/rce_offsets_entry.js", "w").write(output)
 
+          print("\n=== FINAL OUTPUT ===\n")
           print(output)
           PYTHON
 
           DEVICE_MODEL="${{ github.event.inputs.device_model }}" \
           IOS_VERSION="${{ github.event.inputs.ios_version }}" \
           BUILD_NUMBER="${{ github.event.inputs.build_number }}" \
-          python3 kit/parse_and_generate.py
+          python3 kit/parse.py
 
-      - name: Package Output
+      - name: Package
         run: |
-          tar -czf ipsw_out.tgz kit/
+          tar -czf out.tgz kit/
           ls -la kit/
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: ipsw-out-${{ github.event.inputs.build_number }}
-          path: ipsw_out.tgz
+          name: ipsw-output
+          path: out.tgz
