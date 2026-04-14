@@ -2,6 +2,19 @@ name: IPSW Extraction Workflow (iOS 18.4.1)
 
 on:
   workflow_dispatch:
+    inputs:
+      device_model:
+        description: 'Device Model (e.g., iPhone17,3)'
+        required: true
+        default: 'iPhone17,3'
+      build_number:
+        description: 'Build Number (e.g., 22E252)'
+        required: true
+        default: '22E252'
+      ios_version:
+        description: 'iOS Version (e.g., 18.4.1)'
+        required: true
+        default: '18.4.1'
 
 jobs:
   extract:
@@ -19,11 +32,14 @@ jobs:
           tar -xzf /tmp/jtool2.tgz -C /tmp
           sudo mv /tmp/jtool2 /usr/local/bin/
           chmod +x /usr/local/bin/jtool2
+          # Install radare2 for additional analysis
+          brew install radare2
 
-      - name: Download IPSW (iPhone 16, iOS 18.4.1 build 22E252)
+      - name: Download IPSW
         run: |
           mkdir -p firmware
-          URL="https://updates.cdn-apple.com/2025SpringFCS/fullrestores/082-30380/AD76C77E-51AA-4D55-A074-9C0E7545D784/iPhone17,3_18.4.1_22E252_Restore.ipsw"
+          URL="https://updates.cdn-apple.com/2025SpringFCS/fullrestores/082-30380/AD76C77E-51AA-4D55-A074-9C0E7545D784/${{ github.event.inputs.device_model }}_${{ github.event.inputs.ios_version }}_${{ github.event.inputs.build_number }}_Restore.ipsw"
+          echo "Downloading from: $URL"
           curl -L --retry 3 --retry-delay 2 -o firmware/device.ipsw "$URL"
           ls -lh firmware/device.ipsw
           if [ ! -s firmware/device.ipsw ]; then
@@ -39,154 +55,211 @@ jobs:
           echo "Kernel: $(ls kit/kernel/)"
           echo "dyld_shared_cache: $(find kit/dyld -name 'dyld_shared_cache_arm64e' | head -1)"
 
-      - name: Extract JavaScriptCore (full framework path)
+      - name: Reassemble dyld_shared_cache
         run: |
-          DSC=$(find kit/dyld -name 'dyld_shared_cache_arm64e' | head -1)
-          mkdir -p kit/jsc
-          # Use full framework path to avoid ambiguity
+          CACHE_DIR=$(find kit/dyld -type d -name "*${{ github.event.inputs.build_number }}*" | head -1)
+          cd "$CACHE_DIR"
+          echo "Reassembling dyld_shared_cache in: $(pwd)"
+          
+          # Reassemble split cache
+          if ls dyld_shared_cache_arm64e.?? 2>/dev/null; then
+            cat dyld_shared_cache_arm64e.?? > dyld_shared_cache_arm64e.combined
+            echo "Reassembled combined cache: $(ls -lh dyld_shared_cache_arm64e.combined)"
+          fi
+          
+          # Also extract using ipsw
+          cd ..
+          DSC=$(find . -name "dyld_shared_cache_arm64e" -type f ! -name "*.combined" ! -name "*.symbols" | head -1)
+          if [ -n "$DSC" ]; then
+            echo "Extracting symbols from: $DSC"
+            ipsw dyld symbols "$DSC" > dyld_symbols.txt 2>/dev/null || true
+          fi
+
+      - name: Extract Frameworks from dyld_shared_cache
+        run: |
+          CACHE_DIR=$(find kit/dyld -type d -name "*${{ github.event.inputs.build_number }}*" | head -1)
+          DSC=$(find "$CACHE_DIR" -name "dyld_shared_cache_arm64e" -type f ! -name "*.combined" ! -name "*.symbols" | head -1)
+          
+          if [ -z "$DSC" ]; then
+            DSC="$CACHE_DIR/dyld_shared_cache_arm64e.combined"
+          fi
+          
+          echo "Using dyld cache: $DSC"
+          
+          # Extract frameworks with full paths
+          mkdir -p kit/jsc kit/webcore kit/avfaudio kit/dyld_bin
+          
           ipsw dyld extract "$DSC" \
             "/System/Library/Frameworks/JavaScriptCore.framework/JavaScriptCore" \
-            --output kit/jsc/ --force
-          ls -lh kit/jsc/
-
-      - name: Extract WebCore (full framework path)
-        run: |
-          DSC=$(find kit/dyld -name 'dyld_shared_cache_arm64e' | head -1)
-          mkdir -p kit/webcore
-          # Full path for WebCore framework
+            --output kit/jsc/ --force 2>/dev/null || \
+          ipsw dyld extract "$DSC" \
+            "JavaScriptCore" --output kit/jsc/ --force 2>/dev/null || true
+          
           ipsw dyld extract "$DSC" \
             "/System/Library/PrivateFrameworks/WebCore.framework/WebCore" \
-            --output kit/webcore/ --force
-          ls -lh kit/webcore/
-
-      - name: Extract AVFAudio (full framework path)
-        run: |
-          DSC=$(find kit/dyld -name 'dyld_shared_cache_arm64e' | head -1)
-          mkdir -p kit/avfaudio
+            --output kit/webcore/ --force 2>/dev/null || \
+          ipsw dyld extract "$DSC" \
+            "WebCore" --output kit/webcore/ --force 2>/dev/null || true
+          
           ipsw dyld extract "$DSC" \
             "/System/Library/Frameworks/AVFAudio.framework/AVFAudio" \
-            --output kit/avfaudio/ --force
-          ls -lh kit/avfaudio/
-
-      - name: Extract dyld (full path)
-        run: |
-          DSC=$(find kit/dyld -name 'dyld_shared_cache_arm64e' | head -1)
-          mkdir -p kit/dyld_bin
+            --output kit/avfaudio/ --force 2>/dev/null || \
+          ipsw dyld extract "$DSC" \
+            "AVFAudio" --output kit/avfaudio/ --force 2>/dev/null || true
+          
           ipsw dyld extract "$DSC" \
             "/usr/lib/dyld" \
-            --output kit/dyld_bin/ --force
-          ls -lh kit/dyld_bin/
+            --output kit/dyld_bin/ --force 2>/dev/null || true
 
-      - name: Extract All Symbol Offsets (jtool2)
+      - name: Extract Offsets (Multiple Methods)
         run: |
-          JSC=$(find kit/jsc -type f | head -1)
-          WEBCORE=$(find kit/webcore -type f | head -1)
-          AVFAUDIO=$(find kit/avfaudio -type f | head -1)
-          DYLD=$(find kit/dyld_bin -type f | head -1)
-
-          echo "=== iOS 18.4.1 (22E252) Offsets ===" > kit/offsets.txt
+          CACHE_DIR=$(find kit/dyld -type d -name "*${{ github.event.inputs.build_number }}*" | head -1)
+          DSC="$CACHE_DIR/dyld_shared_cache_arm64e"
+          SYMBOLS="$CACHE_DIR/dyld_shared_cache_arm64e.symbols"
+          
+          echo "=== iOS ${{ github.event.inputs.ios_version }} (${{ github.event.inputs.build_number }}) Offsets ===" > kit/offsets.txt
           echo "" >> kit/offsets.txt
-
-          if [ -f "$JSC" ]; then
-            echo "--- JavaScriptCore ---" >> kit/offsets.txt
-            jtool2 --arch arm64e -d "$JSC" 2>/dev/null | \
-              grep -E 'globalFuncParseFloat|jitAllowList|JITThunks|_ZN3JSC' >> kit/offsets.txt || true
+          
+          # Method 1: Use .symbols file if it exists
+          if [ -f "$SYMBOLS" ]; then
+            echo "--- Method 1: .symbols file ---" >> kit/offsets.txt
+            echo "JavaScriptCore:" >> kit/offsets.txt
+            grep -E "globalFuncParseFloat|jitAllowList" "$SYMBOLS" >> kit/offsets.txt 2>/dev/null || true
+            echo "WebCore:" >> kit/offsets.txt
+            grep -E "DedicatedWorkerGlobalScope|allScriptExecutionContextsMap" "$SYMBOLS" >> kit/offsets.txt 2>/dev/null || true
+            echo "AVFAudio:" >> kit/offsets.txt
+            grep -E "AVSpeechSynthesis|AVLoadSpeech" "$SYMBOLS" >> kit/offsets.txt 2>/dev/null || true
+            echo "dyld:" >> kit/offsets.txt
+            grep -E "dlopen|dlsym|gAPIs" "$SYMBOLS" >> kit/offsets.txt 2>/dev/null || true
+          fi
+          
+          # Method 2: Use nm on extracted frameworks
+          echo "" >> kit/offsets.txt
+          echo "--- Method 2: nm on extracted frameworks ---" >> kit/offsets.txt
+          
+          for framework in jsc webcore avfaudio; do
+            FW=$(find kit/$framework -type f ! -name "*.txt" | head -1)
+            if [ -f "$FW" ]; then
+              echo "=== $(echo $framework | tr '[:lower:]' '[:upper:]') ===" >> kit/offsets.txt
+              nm -gU "$FW" 2>/dev/null | grep -E "globalFuncParseFloat|jitAllowList|DedicatedWorkerGlobalScope|AVSpeech" >> kit/offsets.txt || true
+            fi
+          done
+          
+          # Method 3: Use jtool2 on the combined cache
+          echo "" >> kit/offsets.txt
+          echo "--- Method 3: jtool2 on combined cache ---" >> kit/offsets.txt
+          if [ -f "$CACHE_DIR/dyld_shared_cache_arm64e.combined" ]; then
+            jtool2 --arch arm64e --dyld "$CACHE_DIR/dyld_shared_cache_arm64e.combined" 2>/dev/null | \
+              grep -E "globalFuncParseFloat|jitAllowList|DedicatedWorkerGlobalScope|AVSpeech|dlopen" >> kit/offsets.txt || true
+          elif [ -f "$DSC" ]; then
+            jtool2 --arch arm64e --dyld "$DSC" 2>/dev/null | \
+              grep -E "globalFuncParseFloat|jitAllowList|DedicatedWorkerGlobalScope|AVSpeech|dlopen" >> kit/offsets.txt || true
           fi
 
-          if [ -f "$WEBCORE" ]; then
-            echo "--- WebCore ---" >> kit/offsets.txt
-            jtool2 --arch arm64e -d "$WEBCORE" 2>/dev/null | \
-              grep -E 'DedicatedWorkerGlobalScope|allScriptExecutionContextsMap|WebCore::' >> kit/offsets.txt || true
-          fi
-
-          if [ -f "$AVFAUDIO" ]; then
-            echo "--- AVFAudio ---" >> kit/offsets.txt
-            jtool2 --arch arm64e -d "$AVFAUDIO" 2>/dev/null | \
-              grep -E 'AVSpeechSynthesis|AVLoadSpeech' >> kit/offsets.txt || true
-          fi
-
-          if [ -f "$DYLD" ]; then
-            echo "--- dyld ---" >> kit/offsets.txt
-            jtool2 --arch arm64e -d "$DYLD" 2>/dev/null | \
-              grep -E 'dlopen|dlsym|_dyld_|gAPIs' >> kit/offsets.txt || true
-          fi
-
-          cat kit/offsets.txt
-
-      - name: Find libsystem_pthread and linkedit base (from kernel)
+      - name: Parse Offsets and Generate rce_offsets Entry
         run: |
-          KC=$(find kit/kernel -name 'kernelcache.release.*' | head -1)
+          cat > kit/parse_and_generate.py << 'PYTHON'
+          import re
+          import os
+          import json
+          
+          def parse_offsets(offsets_file):
+              """Parse offsets from the offsets.txt file"""
+              offsets = {}
+              
+              if not os.path.exists(offsets_file):
+                  return offsets
+              
+              with open(offsets_file, 'r') as f:
+                  content = f.read()
+              
+              # Patterns to match
+              patterns = {
+                  "AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken": r'(AVLoadSpeechSynthesisImplementation_onceToken|__AVLoadSpeechSynthesisImplementation_onceToken).*?([0-9a-f]{8,16})',
+                  "AVFAudio__OBJC_CLASS__AVSpeechSynthesisVoice": r'(OBJC_CLASS.*AVSpeechSynthesisVoice).*?([0-9a-f]{8,16})',
+                  "JavaScriptCore__globalFuncParseFloat": r'(globalFuncParseFloat).*?([0-9a-f]{8,16})',
+                  "JavaScriptCore__jitAllowList": r'(jitAllowList).*?([0-9a-f]{8,16})',
+                  "WebCore__DedicatedWorkerGlobalScope_vtable": r'(DedicatedWorkerGlobalScope.*vtable).*?([0-9a-f]{8,16})',
+                  "dyld__dlopen_from_lambda_ret": r'(dlopen_from_lambda_ret).*?([0-9a-f]{8,16})',
+              }
+              
+              for name, pattern in patterns.items():
+                  match = re.search(pattern, content, re.IGNORECASE | re.MULTILINE)
+                  if match:
+                      addr = match.group(2)
+                      if len(addr) <= 16:
+                          offsets[name] = f"0x{addr.lstrip('0')}n"
+                          print(f"Found {name}: 0x{addr}n")
+                  else:
+                      print(f"Not found: {name}")
+              
+              return offsets
+          
+          # Parse offsets
+          offsets = parse_offsets('kit/offsets.txt')
+          
+          # Generate rce_offsets entry
+          device_model = f"${{ github.event.inputs.device_model }}_{${{ github.event.inputs.ios_version }}_{${{ github.event.inputs.build_number }}}".replace('.', '_')
+          
+          output = f'rce_offsets["{device_model}"] = {json.dumps(offsets, indent=3)};'
+          
+          with open('kit/rce_offsets_entry.js', 'w') as f:
+              f.write(output)
+          
+          print("\n=== Generated rce_offsets Entry ===\n")
+          print(output)
+          
+          # Also save as JSON for reference
+          with open('kit/offsets.json', 'w') as f:
+              json.dump(offsets, f, indent=3)
+          PYTHON
+          
+          python3 kit/parse_and_generate.py
+
+      - name: Extract Kernel Offsets (pthread_create, etc.)
+        run: |
+          KC=$(find kit/kernel -name "kernelcache.release.*" | head -1)
           if [ -z "$KC" ]; then
-            KC=$(find kit/kernel -name 'kernelcache.research.*' | head -1)
+            KC=$(find kit/kernel -name "kernelcache.research.*" | head -1)
           fi
-          echo "Analyzing kernelcache: $KC"
           
-          # Extract __TEXT_EXEC segment info
-          echo "=== Kernel __TEXT_EXEC info ===" > kit/kernel_info.txt
-          jtool2 --arch arm64e -l "$KC" 2>/dev/null | grep -A5 "__TEXT_EXEC" >> kit/kernel_info.txt || true
-          
-          # Look for pthread_create symbol
-          echo "=== pthread_create in kernel ===" >> kit/kernel_info.txt
-          nm -g "$KC" 2>/dev/null | grep -i pthread_create >> kit/kernel_info.txt || true
-          
-          cat kit/kernel_info.txt
-
-      - name: Generate rce_offsets Entry
-        run: |
-          cat > kit/generate_offsets.js << 'EOF'
-          const fs = require('fs');
-
-          // Parse offsets from kit/offsets.txt
-          // This is a template - replace with actual values from the extraction
-          const offsets = {
-              // AVFAudio (from AVFAudio section)
-              "AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken": "0x????????n",
-              "AVFAudio__OBJC_CLASS__AVSpeechSynthesisMarker": "0x????????n",
-              "AVFAudio__OBJC_CLASS__AVSpeechSynthesisProviderRequest": "0x????????n",
-              "AVFAudio__OBJC_CLASS__AVSpeechSynthesisVoice": "0x????????n",
-              "AVFAudio__OBJC_CLASS__AVSpeechUtterance": "0x????????n",
-              "AVFAudio__cfstr_SystemLibraryTextToSpeech": "0x????????n",
-              
-              // JavaScriptCore
-              "JavaScriptCore__globalFuncParseFloat": "0x????????n",
-              "JavaScriptCore__jitAllowList": "0x????????n",
-              "JavaScriptCore__jitAllowList_once": "0x????????n",
-              
-              // WebCore
-              "WebCore__DedicatedWorkerGlobalScope_vtable": "0x????????n",
-              "WebCore__ZZN7WebCoreL29allScriptExecutionContextsMapEvE8contexts": "0x????????n",
-              "WebCore__PAL_getPKContactClass": "0x????????n",
-              "WebCore__softLinkMediaAccessibilityMACaptionAppearanceGetDisplayType": "0x????????n",
-              
-              // dyld
-              "dyld__dlopen_from_lambda_ret": "0x????????n",
-              "dyld__signPointer": "0x????????n",
-              "dyld__gAPIs": "0x????????n",
-              
-              // libsystem
-              "libsystem_c__atexit_mutex": "0x????????n",
-              "libsystem_pthread_base": "0x????????n",
-          };
-
-          const device_model = "iPhone17,3_18.4.1_22E252";
-          const output = `rce_offsets["${device_model}"] = ${JSON.stringify(offsets, null, 3)};`;
-          fs.writeFileSync('kit/rce_offsets_entry.js', output);
-          console.log("Generated: kit/rce_offsets_entry.js");
-          console.log(output);
-          EOF
-          node kit/generate_offsets.js
+          if [ -f "$KC" ]; then
+            echo "=== Kernel Offsets ===" > kit/kernel_offsets.txt
+            echo "Kernelcache: $KC" >> kit/kernel_offsets.txt
+            
+            # Find pthread_create
+            jtool2 --arch arm64e -d "$KC" 2>/dev/null | grep -i pthread_create >> kit/kernel_offsets.txt || true
+            
+            # Find __TEXT_EXEC base
+            jtool2 --arch arm64e -l "$KC" 2>/dev/null | grep -A5 "__TEXT_EXEC" >> kit/kernel_offsets.txt || true
+            
+            # Find exception handling symbols
+            nm -gU "$KC" 2>/dev/null | grep -E "exception|thread|mach" | head -20 >> kit/kernel_offsets.txt || true
+          fi
 
       - name: Package Output
         run: |
           tar -czf ipsw_out.tgz kit/
-          echo "=== Artifact contents ==="
+          echo "=== Artifact Contents ==="
           ls -la kit/
-          echo "=== Offsets preview ==="
-          head -50 kit/offsets.txt
+          echo ""
+          echo "=== Offsets Preview ==="
+          if [ -f kit/offsets.txt ]; then
+            head -100 kit/offsets.txt
+          else
+            echo "offsets.txt not found"
+          fi
+          echo ""
+          echo "=== rce_offsets Entry Preview ==="
+          if [ -f kit/rce_offsets_entry.js ]; then
+            cat kit/rce_offsets_entry.js
+          else
+            echo "rce_offsets_entry.js not found"
+          fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ipsw-out-22E252
+          name: ipsw-out-${{ github.event.inputs.build_number }}
           path: ipsw_out.tgz
           retention-days: 30
