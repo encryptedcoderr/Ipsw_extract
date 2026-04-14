@@ -1,20 +1,7 @@
-name: IPSW Extraction Workflow
+name: IPSW Extraction Workflow (iOS 18.4.1)
 
 on:
   workflow_dispatch:
-    inputs:
-      device_model:
-        description: 'Device Model (e.g., iPhone17,3)'
-        required: true
-        default: 'iPhone17,3'
-      build_number:
-        description: 'Build Number (e.g., 22E252)'
-        required: true
-        default: '22E252'
-      ios_version:
-        description: 'iOS Version (e.g., 18.4.1)'
-        required: true
-        default: '18.4.1'
 
 jobs:
   extract:
@@ -27,246 +14,99 @@ jobs:
       - name: Install Tools
         run: |
           brew install ipsw
-          # Install jtool2 properly
+          # Install jtool2
           curl -L https://newosxbook.com/tools/jtool2.tgz -o /tmp/jtool2.tgz
           tar -xzf /tmp/jtool2.tgz -C /tmp
           sudo mv /tmp/jtool2 /usr/local/bin/
           chmod +x /usr/local/bin/jtool2
-          # Install libimobiledevice for USB logging (optional)
-          brew install libimobiledevice
 
-      - name: Download IPSW
+      - name: Download IPSW (iPhone 16, iOS 18.4.1 build 22E252)
         run: |
           mkdir -p firmware
-          # Build URL dynamically based on inputs
-          # Note: You'll need to update URL patterns for each new iOS version
-          echo "Downloading IPSW for ${{ github.event.inputs.device_model }} iOS ${{ github.event.inputs.ios_version }} build ${{ github.event.inputs.build_number }}"
-          
-          # Common URL patterns (you may need to adjust)
-          # Pattern 1: https://updates.cdn-apple.com/.../Restore.ipsw
-          # Pattern 2: https://secure-appldnld.apple.com/.../Restore.ipsw
-          
-          # For now, use a known URL or require user to provide URL
-          IPSW_URL="https://updates.cdn-apple.com/2025SpringFCS/fullrestores/082-30380/AD76C77E-51AA-4D55-A074-9C0E7545D784/${{ github.event.inputs.device_model }}_${{ github.event.inputs.ios_version }}_${{ github.event.inputs.build_number }}_Restore.ipsw"
-          
-          curl -L -o "firmware/device.ipsw" "$IPSW_URL" || {
-            echo "ERROR: Failed to download IPSW. URL may be invalid."
-            echo "Please manually download from: https://ipsw.me/${{ github.event.inputs.device_model }}"
+          # YOUR WORKING LINK
+          URL="https://updates.cdn-apple.com/2025SpringFCS/fullrestores/082-30380/AD76C77E-51AA-4D55-A074-9C0E7545D784/iPhone17,3_18.4.1_22E252_Restore.ipsw"
+          echo "Downloading from: $URL"
+          curl -L --retry 3 --retry-delay 2 -o firmware/device.ipsw "$URL"
+          ls -lh firmware/device.ipsw
+          # Verify download succeeded
+          if [ ! -s firmware/device.ipsw ]; then
+            echo "ERROR: IPSW download failed"
             exit 1
-          }
-          ls -lh firmware
+          fi
 
-      - name: Extract Kernel
+      - name: Extract Kernel and dyld_shared_cache
         run: |
-          mkdir -p kit/kernel
+          mkdir -p kit/kernel kit/dyld
           ipsw extract --kernel firmware/device.ipsw --output kit/kernel
-          
-          # Find kernelcache file
-          KC=$(find kit/kernel -name 'kernelcache.*' | head -1)
-          if [ -z "$KC" ]; then
-            echo "No kernelcache found"
-            exit 1
-          fi
-          echo "Found kernelcache: $KC"
-          file "$KC"
-
-      - name: Extract dyld_shared_cache
-        run: |
-          mkdir -p kit/dyld
           ipsw extract --dyld firmware/device.ipsw --output kit/dyld
-          
-          # Find the dyld_shared_cache
-          DSC=$(find kit/dyld -name 'dyld_shared_cache_arm64e' | head -1)
-          if [ -z "$DSC" ]; then
-            echo "ERROR: dyld_shared_cache not found"
-            exit 1
-          fi
-          echo "Found dyld_shared_cache: $DSC"
-          ls -lh "$DSC"
+          echo "Kernel: $(ls kit/kernel/)"
+          echo "dyld_shared_cache: $(find kit/dyld -name 'dyld_shared_cache_arm64e')"
 
-      - name: Extract JavaScriptCore
-        run: |
-          mkdir -p kit/jsc
-          DSC=$(find kit/dyld -name 'dyld_shared_cache_arm64e' | head -1)
-          
-          # Extract JSC as dylib
-          ipsw dyld extract "$DSC" \
-            "/System/Library/Frameworks/JavaScriptCore.framework/JavaScriptCore" \
-            --output kit/jsc/ --force || \
-          ipsw dyld extract "$DSC" \
-            "JavaScriptCore" \
-            --output kit/jsc/ --force
-          
-          # Find extracted JSC
-          JSC=$(find kit/jsc -type f -name 'JavaScriptCore' | head -1)
-          if [ -z "$JSC" ]; then
-            echo "JavaScriptCore extraction failed"
-            exit 1
-          fi
-          
-          # Extract arm64e slice
-          lipo "$JSC" -verify_arch arm64e && {
-            lipo "$JSC" -extract arm64e -output kit/jsc/JavaScriptCore.arm64e
-          } || {
-            cp "$JSC" kit/jsc/JavaScriptCore.arm64e
-          }
-          
-          echo "Extracted JSC: $(ls -lh kit/jsc/JavaScriptCore.arm64e)"
-
-      - name: Extract WebCore and AVFAudio
+      - name: Extract JavaScriptCore, WebCore, AVFAudio
         run: |
           DSC=$(find kit/dyld -name 'dyld_shared_cache_arm64e' | head -1)
-          
-          # Extract WebCore
-          mkdir -p kit/webcore
-          ipsw dyld extract "$DSC" \
-            "/System/Library/Frameworks/WebKit.framework/WebCore" \
-            --output kit/webcore/ --force || \
-          ipsw dyld extract "$DSC" \
-            "WebCore" --output kit/webcore/ --force
-          
-          # Extract AVFAudio
-          mkdir -p kit/avfaudio
-          ipsw dyld extract "$DSC" \
-            "/System/Library/Frameworks/AVFAudio.framework/AVFAudio" \
-            --output kit/avfaudio/ --force || \
-          ipsw dyld extract "$DSC" \
-            "AVFAudio" --output kit/avfaudio/ --force
-          
-          echo "WebCore: $(ls kit/webcore/ 2>/dev/null || echo 'not found')"
-          echo "AVFAudio: $(ls kit/avfaudio/ 2>/dev/null || echo 'not found')"
+          mkdir -p kit/jsc kit/webcore kit/avfaudio
+          ipsw dyld extract "$DSC" JavaScriptCore --output kit/jsc/ --force
+          ipsw dyld extract "$DSC" WebCore --output kit/webcore/ --force
+          ipsw dyld extract "$DSC" AVFAudio --output kit/avfaudio/ --force
+          ls -lh kit/jsc/ kit/webcore/ kit/avfaudio/
 
-      - name: Extract Symbol Offsets (jtool2)
+      - name: Extract All Symbol Offsets (jtool2)
         run: |
-          JSC=kit/jsc/JavaScriptCore.arm64e
+          JSC=$(find kit/jsc -type f | head -1)
           WEBCORE=$(find kit/webcore -type f | head -1)
           AVFAUDIO=$(find kit/avfaudio -type f | head -1)
-          
-          echo "=== JavaScriptCore Offsets ===" > kit/offsets.txt
-          jtool2 --arch arm64e -d "$JSC" 2>/dev/null | grep -E 'globalFuncParseFloat|jitAllowList|JITThunks|_ZN3JSC' >> kit/offsets.txt || true
-          
-          echo "=== WebCore Offsets ===" >> kit/offsets.txt
-          [ -n "$WEBCORE" ] && jtool2 --arch arm64e -d "$WEBCORE" 2>/dev/null | grep -E 'DedicatedWorkerGlobalScope|allScriptExecutionContextsMap|WebCore::' >> kit/offsets.txt || true
-          
-          echo "=== AVFAudio Offsets ===" >> kit/offsets.txt
-          [ -n "$AVFAUDIO" ] && jtool2 --arch arm64e -d "$AVFAUDIO" 2>/dev/null | grep -E 'AVSpeechSynthesis|AVLoadSpeech' >> kit/offsets.txt || true
-          
-          echo "=== dyld Offsets ===" >> kit/offsets.txt
-          jtool2 --arch arm64e -d /usr/lib/dyld 2>/dev/null | grep -E 'dlopen|dlsym|_dyld_|gAPIs' >> kit/offsets.txt || true
-          
+
+          echo "=== iOS 18.4.1 (22E252) Offsets ===" > kit/offsets.txt
+          echo "" >> kit/offsets.txt
+
+          for file in "$JSC" "$WEBCORE" "$AVFAUDIO"; do
+            name=$(basename "$file")
+            echo "--- $name ---" >> kit/offsets.txt
+            jtool2 --arch arm64e -d "$file" 2>/dev/null | \
+              grep -E 'AVSpeechSynthesis|AVLoadSpeech|globalFuncParseFloat|jitAllowList|DedicatedWorkerGlobalScope|allScriptExecutionContextsMap' \
+              >> kit/offsets.txt || true
+          done
+
+          # dyld symbols
+          echo "--- dyld ---" >> kit/offsets.txt
+          jtool2 --arch arm64e -d /usr/lib/dyld 2>/dev/null | \
+            grep -E 'dlopen|dlsym|gAPIs' >> kit/offsets.txt || true
+
           cat kit/offsets.txt
 
-      - name: Find Gadget Offsets (Pattern Scan)
-        run: |
-          JSC=kit/jsc/JavaScriptCore.arm64e
-          
-          # Common gadget patterns (ARM64)
-          cat > kit/find_gadgets.py << 'PYTHON'
-          import sys
-          import re
-          
-          def find_gadgets(data, patterns):
-              results = {}
-              for name, pattern in patterns.items():
-                  pattern_bytes = bytes.fromhex(pattern.replace('??', '00'))
-                  # Simple search (improve with wildcard support)
-                  for i in range(len(data) - len(pattern_bytes)):
-                      match = True
-                      for j, b in enumerate(pattern_bytes):
-                          if pattern[2*j:2*j+2] != '??' and data[i+j] != b:
-                              match = False
-                              break
-                      if match:
-                          results[name] = hex(i)
-                          break
-              return results
-          
-          with open(sys.argv[1], 'rb') as f:
-              data = f.read()
-          
-          # ARM64 gadget patterns (from rce_module.js)
-          patterns = {
-              "gadget_control_1_ios184": "????????",  # Replace with actual bytes
-              "gadget_control_2_ios184": "????????",
-              "gadget_control_3_ios184": "????????",
-              "gadget_loop_1_ios184": "????????",
-              "gadget_loop_2_ios184": "????????",
-              "gadget_loop_3_ios184": "????????",
-              "gadget_set_all_registers_ios184": "????????",
-          }
-          
-          results = find_gadgets(data, patterns)
-          for name, offset in results.items():
-              print(f"{name}: {offset}")
-          PYTHON
-          
-          python3 kit/find_gadgets.py "$JSC" > kit/gadget_offsets.txt
-          cat kit/gadget_offsets.txt
-
-      - name: Generate rce_offsets Entry
+      - name: Generate rce_offsets Entry (JavaScript)
         run: |
           cat > kit/generate_offsets.js << 'EOF'
-          // Run in Node.js to generate rce_offsets entry
           const fs = require('fs');
-          
-          // Parse offsets from extracted data
+
+          // These values must be extracted from kit/offsets.txt
+          // Replace the placeholders with actual hex addresses
           const offsets = {
-              // AVFAudio
               "AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken": "0x????????n",
               "AVFAudio__OBJC_CLASS__AVSpeechSynthesisMarker": "0x????????n",
-              "AVFAudio__OBJC_CLASS__AVSpeechSynthesisProviderRequest": "0x????????n",
               "AVFAudio__OBJC_CLASS__AVSpeechSynthesisVoice": "0x????????n",
-              "AVFAudio__OBJC_CLASS__AVSpeechUtterance": "0x????????n",
-              "AVFAudio__cfstr_SystemLibraryTextToSpeech": "0x????????n",
-              
-              // JavaScriptCore
               "JavaScriptCore__globalFuncParseFloat": "0x????????n",
               "JavaScriptCore__jitAllowList": "0x????????n",
               "JavaScriptCore__jitAllowList_once": "0x????????n",
-              
-              // WebCore
               "WebCore__DedicatedWorkerGlobalScope_vtable": "0x????????n",
               "WebCore__ZZN7WebCoreL29allScriptExecutionContextsMapEvE8contexts": "0x????????n",
-              "WebCore__PAL_getPKContactClass": "0x????????n",
-              
-              // dyld
               "dyld__dlopen_from_lambda_ret": "0x????????n",
               "dyld__signPointer": "0x????????n",
-              "dyld__gAPIs": "0x????????n",
-              
-              // Gadgets (from previous step)
-              "gadget_control_1_ios184": "0x????????n",
-              "gadget_control_2_ios184": "0x????????n",
-              "gadget_control_3_ios184": "0x????????n",
-              "gadget_loop_1_ios184": "0x????????n",
-              "gadget_loop_2_ios184": "0x????????n",
-              "gadget_loop_3_ios184": "0x????????n",
-              "gadget_set_all_registers_ios184": "0x????????n",
+              "dyld__gAPIs": "0x????????n"
           };
-          
-          const device_model = "${{ github.event.inputs.device_model }}_${{ github.event.inputs.ios_version }}_${{ github.event.inputs.build_number }}".replace(/\./g, '_');
-          
+
+          const device_model = "iPhone17,3_18.4.1_22E252";
           const output = `rce_offsets["${device_model}"] = ${JSON.stringify(offsets, null, 3)};`;
           fs.writeFileSync('kit/rce_offsets_entry.js', output);
           console.log("Generated: kit/rce_offsets_entry.js");
           console.log(output);
           EOF
-          
           node kit/generate_offsets.js
-
-      - name: Package Output
-        run: |
-          tar -czf ipsw_out.tgz kit/
-          echo "=== Output Summary ==="
-          echo "Kernel: $(find kit/kernel -name 'kernelcache.*' | head -1)"
-          echo "dyld_shared_cache: $(find kit/dyld -name 'dyld_shared_cache_arm64e' | head -1)"
-          echo "Offsets: kit/offsets.txt"
-          echo "Gadgets: kit/gadget_offsets.txt"
-          echo "rce_offsets entry: kit/rce_offsets_entry.js"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ipsw-out-${{ github.event.inputs.build_number }}
+          name: ipsw-out-22E252
           path: ipsw_out.tgz
           retention-days: 30
